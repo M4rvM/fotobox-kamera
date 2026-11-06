@@ -23,6 +23,20 @@ button{font:inherit;font-size:18px;font-weight:600;padding:14px 16px;border-radi
 button.ghost{background:transparent;color:var(--snow)}
 button:disabled{opacity:.4}
 .hint{font-size:14px;opacity:.78;line-height:1.45}
+/* Querformat: Bild links, Bedienung rechts, sonst bleibt fürs Bild keine Höhe */
+@media (orientation:landscape) and (max-height:600px){
+  body{display:grid;grid-template-columns:1fr minmax(200px,36%);grid-template-rows:repeat(6,auto) 1fr;
+    align-content:start;gap:8px 14px;
+    padding:calc(env(safe-area-inset-top, 0px) + 10px) calc(env(safe-area-inset-right, 0px) + 12px)
+            calc(env(safe-area-inset-bottom, 0px) + 10px) calc(env(safe-area-inset-left, 0px) + 12px)}
+  body>*{grid-column:2}
+  video{grid-column:1;grid-row:1/-1;height:100%}
+  h1{font-size:20px}
+  #status{font-size:15px;padding:8px 10px}
+  .row{flex-direction:column;gap:8px}
+  button{font-size:16px;padding:10px 12px}
+  #hint{display:none}
+}
 </style>
 </head>
 <body>
