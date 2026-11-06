@@ -33,6 +33,7 @@ button:disabled{opacity:.4}
   <button id="startBtn">Kamera starten</button>
   <button id="switchBtn" class="ghost" disabled>Kamera wechseln</button>
 </div>
+<p class="hint" id="net"></p>
 <p class="hint" id="hint"></p>
 
 <script>
@@ -73,9 +74,48 @@ button:disabled{opacity:.4}
       audio: false,
       video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }
     });
+    // „detail“: bei wenig Bandbreite lieber weniger Bilder pro Sekunde als unscharf
+    stream.getVideoTracks().forEach(t => { try { t.contentHint = 'detail'; } catch (e) {} });
     const v = $('#preview');
     v.srcObject = stream;
     try { await v.play(); } catch (e) {}
+  }
+
+  // Bitrate anheben und anzeigen, wie die Verbindung läuft (direkt im WLAN oder über Umweg).
+  let statsTimer = null, connectStart = 0;
+  function watchCall(c) {
+    clearInterval(statsTimer);
+    let tuned = false, lastBytes = 0, lastTime = 0;
+    statsTimer = setInterval(async () => {
+      const pc = c.peerConnection;
+      if (c !== call || !pc) return;
+      const sender = pc.getSenders().find(s => s.track && s.track.kind === 'video');
+      if (sender && !tuned) {
+        tuned = true;
+        try {
+          const p = sender.getParameters();
+          if (!p.encodings || !p.encodings.length) p.encodings = [{}];
+          p.encodings[0].maxBitrate = 8000000;
+          p.degradationPreference = 'maintain-resolution';
+          await sender.setParameters(p);
+        } catch (e) { console.warn('Bitrate nicht gesetzt', e); }
+      }
+      let route = '', res = '', rate = '';
+      const stats = await pc.getStats();
+      stats.forEach(r => {
+        if (r.type === 'candidate-pair' && r.nominated && r.state === 'succeeded') {
+          const local = stats.get(r.localCandidateId), remote = stats.get(r.remoteCandidateId);
+          const types = [local && local.candidateType, remote && remote.candidateType];
+          route = types.includes('relay') ? 'über Umweg-Server (langsam)' : types.every(t => t === 'host') ? 'direkt im WLAN' : 'über das Internet';
+        }
+        if (r.type === 'outbound-rtp' && r.kind === 'video') {
+          if (r.frameWidth) res = r.frameWidth + '×' + r.frameHeight;
+          if (lastTime) rate = ((r.bytesSent - lastBytes) * 8 / ((r.timestamp - lastTime) * 1000)).toFixed(1) + ' Mbit/s';
+          lastBytes = r.bytesSent; lastTime = r.timestamp;
+        }
+      });
+      if (route) $('#net').textContent = 'Verbindung ' + route + (res ? ' · ' + res : '') + (rate ? ' · ' + rate : '');
+    }, 2000);
   }
 
   async function start() {
@@ -105,6 +145,8 @@ button:disabled{opacity:.4}
     clearTimeout(openTimer);
     if (peer) { try { peer.destroy(); } catch (e) {} }
     conn = null; call = null; halted = false;
+    connectStart = Date.now();
+    $('#net').textContent = '';
     setStatus('Verbinde mit der Fotobox …');
     peer = new Peer();
     peer.on('open', () => {
@@ -157,7 +199,8 @@ button:disabled{opacity:.4}
         key = msg.k; // die Fotobox hat den Schlüssel erneuert; für Neuladen der Seite merken
         history.replaceState(null, '', '#' + new URLSearchParams({ id: target, k: key }));
         call = peer.call(target, stream);
-        setStatus('Verbunden. Das Bild ist jetzt auf dem Laptop zu sehen.', 'ok');
+        watchCall(call);
+        setStatus('Verbunden nach ' + ((Date.now() - connectStart) / 1000).toFixed(1) + ' s. Das Bild ist jetzt auf dem Laptop zu sehen.', 'ok');
       } else {
         rejected();
       }
