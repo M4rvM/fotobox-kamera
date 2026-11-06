@@ -33,21 +33,36 @@ button:disabled{opacity:.4}
   <button id="startBtn">Kamera starten</button>
   <button id="switchBtn" class="ghost" disabled>Kamera wechseln</button>
 </div>
-<p class="hint">Lass diese Seite im Vordergrund geöffnet und sperre das iPhone nicht. Stell dafür unter Einstellungen › Anzeige &amp; Helligkeit › Automatische Sperre auf „Nie“.</p>
+<p class="hint" id="hint"></p>
 
 <script>
 (() => {
   const $ = s => document.querySelector(s);
-  const target = new URLSearchParams(location.search).get('id');
+  // ID und Kopplungsschlüssel stehen im #-Teil des QR-Links; der geht an keinen Server.
+  const params = new URLSearchParams(location.hash.slice(1));
+  const target = params.get('id');
+  let key = params.get('k');
+  const android = /Android/i.test(navigator.userAgent);
   let stream = null, peer = null, conn = null, call = null;
-  let facing = 'environment', retryTimer = null, openTimer = null, wakeLock = null, started = false;
+  let facing = 'environment', retryTimer = null, openTimer = null, wakeLock = null, started = false, halted = false;
 
   function setStatus(text, cls) { const s = $('#status'); s.textContent = text; s.className = cls || ''; }
 
-  if (!target) {
+  $('#hint').textContent = android
+    ? 'Lass diese Seite in Chrome im Vordergrund geöffnet und schalte den Bildschirm nicht aus. Stell dafür unter Einstellungen › Display › Bildschirm-Zeitlimit die längste Zeit ein.'
+    : 'Lass diese Seite im Vordergrund geöffnet und sperre das iPhone nicht. Stell dafür unter Einstellungen › Anzeige & Helligkeit › Automatische Sperre auf „Nie“.';
+
+  const rnd = n => { const a = new Uint8Array(n); crypto.getRandomValues(a); return Array.from(a, b => b.toString(16).padStart(2, '0')).join(''); };
+  async function hmac(k, msg) {
+    const enc = new TextEncoder();
+    const ck = await crypto.subtle.importKey('raw', enc.encode(k), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+    return Array.from(new Uint8Array(await crypto.subtle.sign('HMAC', ck, enc.encode(msg))), b => b.toString(16).padStart(2, '0')).join('');
+  }
+
+  if (!target || !key || !/^pruessner-fotobox-[0-9a-f]{18}$/.test(target)) {
     setStatus('Diese Seite weiß nicht, mit welcher Fotobox sie sich verbinden soll. Bitte scanne den QR-Code an der Fotobox.', 'err');
     $('#startBtn').disabled = true;
-  } else if (typeof Peer === 'undefined') {
+  } else if (typeof Peer === 'undefined' || !(window.crypto && crypto.subtle)) {
     setStatus('Die Verbindung konnte nicht vorbereitet werden. Prüfe die Internetverbindung und lade die Seite neu.', 'err');
     $('#startBtn').disabled = true;
   }
@@ -70,7 +85,9 @@ button:disabled{opacity:.4}
       await openCamera();
     } catch (e) {
       setStatus(e.name === 'NotAllowedError'
-        ? 'Der Kamerazugriff wurde abgelehnt. Erlaube die Kamera in den Safari-Einstellungen für diese Website und lade die Seite neu.'
+        ? (android
+          ? 'Der Kamerazugriff wurde abgelehnt. Tippe in Chrome links neben der Adresse auf das Symbol › Berechtigungen › Kamera erlauben und lade die Seite neu.'
+          : 'Der Kamerazugriff wurde abgelehnt. Erlaube die Kamera in den Safari-Einstellungen für diese Website und lade die Seite neu.')
         : 'Die Kamera konnte nicht gestartet werden: ' + e.message, 'err');
       $('#startBtn').disabled = false;
       return;
@@ -87,25 +104,25 @@ button:disabled{opacity:.4}
     clearTimeout(retryTimer); retryTimer = null;
     clearTimeout(openTimer);
     if (peer) { try { peer.destroy(); } catch (e) {} }
-    conn = null; call = null;
+    conn = null; call = null; halted = false;
     setStatus('Verbinde mit der Fotobox …');
     peer = new Peer();
     peer.on('open', () => {
-      conn = peer.connect(target, { reliable: true });
+      const c = conn = peer.connect(target, { reliable: true });
       openTimer = setTimeout(() => {
-        if (conn && !conn.open) {
-          setStatus('Keine direkte Verbindung möglich. Sind iPhone und Laptop im selben WLAN? Neuer Versuch …', 'err');
+        if (c === conn && !c.authed) {
+          setStatus('Keine direkte Verbindung möglich. Sind Handy und Laptop im selben WLAN? Neuer Versuch …', 'err');
           lost();
         }
       }, 15000);
-      conn.on('open', () => {
-        clearTimeout(openTimer);
-        call = peer.call(target, stream);
-        setStatus('Verbunden. Das Bild ist jetzt auf dem Laptop zu sehen.', 'ok');
+      c.on('open', () => {
+        // Kopplung: erst muss die Fotobox den Schlüssel beweisen, dann das Handy.
+        c.nonce = rnd(16);
+        c.send({ type: 'hello', n: c.nonce });
       });
-      conn.on('data', onData);
-      conn.on('close', lost);
-      conn.on('error', lost);
+      c.on('data', msg => onData(c, msg));
+      c.on('close', () => { if (c === conn) lost(); });
+      c.on('error', () => { if (c === conn) lost(); });
     });
     peer.on('error', e => {
       if (e.type === 'peer-unavailable') setStatus('Die Fotobox ist gerade nicht erreichbar. Ist sie auf dem Laptop geöffnet? Neuer Versuch in 3 Sekunden …', 'err');
@@ -115,13 +132,38 @@ button:disabled{opacity:.4}
   }
 
   function lost() {
-    if (retryTimer) return;
+    if (retryTimer || halted) return;
     if ($('#status').className !== 'err') setStatus('Verbindung getrennt. Neuer Versuch in 3 Sekunden …', 'err');
     retryTimer = setTimeout(connect, 3000);
   }
 
-  function onData(msg) {
-    if (msg && msg.type === 'capture') sendPhoto(msg.id);
+  function rejected() {
+    halted = true;
+    clearTimeout(openTimer);
+    try { peer.destroy(); } catch (e) {}
+    setStatus('Die Kopplung wurde abgelehnt. Scanne den QR-Code an der Fotobox neu.', 'err');
+  }
+
+  async function onData(c, msg) {
+    if (!msg || c !== conn) return;
+    if (!c.authed) {
+      if (msg.type === 'hello' && !c.proved && typeof msg.n === 'string'
+          && msg.p === await hmac(key, 'kiosk:' + c.nonce)) {
+        c.proved = true;
+        c.send({ type: 'auth', p: await hmac(key, 'phone:' + msg.n) });
+      } else if (msg.type === 'ok' && c.proved && typeof msg.k === 'string') {
+        c.authed = true;
+        clearTimeout(openTimer);
+        key = msg.k; // die Fotobox hat den Schlüssel erneuert; für Neuladen der Seite merken
+        history.replaceState(null, '', '#' + new URLSearchParams({ id: target, k: key }));
+        call = peer.call(target, stream);
+        setStatus('Verbunden. Das Bild ist jetzt auf dem Laptop zu sehen.', 'ok');
+      } else {
+        rejected();
+      }
+      return;
+    }
+    if (msg.type === 'capture') sendPhoto(msg.id);
   }
 
   async function sendPhoto(id) {
