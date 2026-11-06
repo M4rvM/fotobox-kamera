@@ -33,6 +33,7 @@ button:disabled{opacity:.4}
   <button id="startBtn">Kamera starten</button>
   <button id="switchBtn" class="ghost" disabled>Kamera wechseln</button>
 </div>
+<p class="hint" id="cam"></p>
 <p class="hint" id="net"></p>
 <p class="hint" id="hint"></p>
 
@@ -45,7 +46,7 @@ button:disabled{opacity:.4}
   let key = params.get('k');
   const android = /Android/i.test(navigator.userAgent);
   let stream = null, peer = null, conn = null, call = null;
-  let facing = 'environment', retryTimer = null, openTimer = null, wakeLock = null, started = false, halted = false;
+  let retryTimer = null, openTimer = null, wakeLock = null, started = false, halted = false;
 
   function setStatus(text, cls) { const s = $('#status'); s.textContent = text; s.className = cls || ''; }
 
@@ -68,12 +69,24 @@ button:disabled{opacity:.4}
     $('#startBtn').disabled = true;
   }
 
+  // Gewählte Kamera (deviceId) bleibt gespeichert; ohne Wahl nimmt der Browser eine Rückkamera.
+  let camId = null;
+  try { camId = localStorage.getItem('fotobox-cam'); } catch (e) {}
+
   async function openCamera() {
     if (stream) stream.getTracks().forEach(t => t.stop());
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: false,
-      video: { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }
-    });
+    const size = { width: { ideal: 1920 }, height: { ideal: 1080 } };
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false,
+        video: camId ? { deviceId: { exact: camId }, ...size } : { facingMode: { ideal: 'environment' }, ...size } });
+    } catch (e) {
+      if (!camId || e.name === 'NotAllowedError') throw e;
+      camId = null; // gespeicherte Kamera gibt es nicht mehr
+      return openCamera();
+    }
+    const track = stream.getVideoTracks()[0];
+    camId = track.getSettings().deviceId || camId;
+    $('#cam').textContent = 'Kamera: ' + (track.label || 'Standard');
     // „detail“: bei wenig Bandbreite lieber weniger Bilder pro Sekunde als unscharf
     stream.getVideoTracks().forEach(t => { try { t.contentHint = 'detail'; } catch (e) {} });
     const v = $('#preview');
@@ -221,8 +234,13 @@ button:disabled{opacity:.4}
   }
 
   async function switchCamera() {
-    facing = facing === 'environment' ? 'user' : 'environment';
-    try { await openCamera(); } catch (e) { setStatus('Die andere Kamera konnte nicht gestartet werden.', 'err'); return; }
+    // Reihum durch alle Kameras des Handys (vorne, Haupt-, Weitwinkel-, Telekamera …)
+    const cams = (await navigator.mediaDevices.enumerateDevices()).filter(d => d.kind === 'videoinput' && d.deviceId);
+    if (cams.length < 2) { setStatus('Es wurde nur eine Kamera gefunden.', 'err'); return; }
+    const i = cams.findIndex(d => d.deviceId === camId);
+    camId = cams[(i + 1) % cams.length].deviceId;
+    try { await openCamera(); } catch (e) { setStatus('Diese Kamera konnte nicht gestartet werden. Tippe nochmal auf „Kamera wechseln“.', 'err'); return; }
+    try { localStorage.setItem('fotobox-cam', camId); } catch (e) {}
     if (call && call.peerConnection) {
       const sender = call.peerConnection.getSenders().find(s => s.track && s.track.kind === 'video');
       if (sender) { try { await sender.replaceTrack(stream.getVideoTracks()[0]); return; } catch (e) {} }
